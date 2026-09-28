@@ -43,7 +43,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.01
+FREE_PRICE_THRESHOLD_USD = 0.0  # المجاني فقط
 WATCH_POLL_INTERVAL_SECONDS = 15  # كل كم ثانية نعيد فحص المجموعات المراقَبة
 
 logging.basicConfig(
@@ -140,8 +140,37 @@ def stage_has_ended(stage: dict) -> bool:
 
 
 def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    price_usd = (price_wei / 1e18) * eth_price_usd
-    return price_usd < FREE_PRICE_THRESHOLD_USD
+    # شراء المجاني فقط: أي سعر أكبر من صفر يتم رفضه.
+    return int(price_wei) == 0
+
+def _iter_strings(value):
+    if isinstance(value, dict):
+        for v in value.values(): yield from _iter_strings(v)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value: yield from _iter_strings(v)
+    elif isinstance(value, str):
+        yield value
+
+def has_x_link(detail: dict) -> bool:
+    for s in _iter_strings(detail):
+        u=s.strip().lower()
+        if u.startswith(("http://","https://")) and ("x.com/" in u or "twitter.com/" in u): return True
+    return False
+
+def has_website_link(detail: dict) -> bool:
+    excluded=("x.com","twitter.com","t.co","opensea.io","discord.com","discord.gg","telegram.me","t.me","instagram.com","facebook.com","youtube.com","youtu.be","tiktok.com","medium.com","github.com")
+    for s in _iter_strings(detail):
+        u=s.strip().lower()
+        if u.startswith(("http://","https://")) and not any(h in u for h in excluded): return True
+    return False
+
+def passes_project_filters(detail: dict) -> tuple[bool, str]:
+    try: max_supply=int(detail.get("max_supply") or 0)
+    except (TypeError,ValueError): return False, "invalid_max_supply"
+    if max_supply <= 0: return False, "unknown_max_supply"
+    if max_supply > 10_000: return False, "max_supply_over_10000"
+    if not (has_x_link(detail) or has_website_link(detail)): return False, "no_x_or_website"
+    return True, "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +243,10 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
     if remaining <= 0:
         return {"success": False, "reason": "sold_out"}
 
+    filters_ok, filter_reason = passes_project_filters(detail)
+    if not filters_ok:
+        return {"success": False, "reason": filter_reason}
+
     contract_address = detail.get("contract_address")
     if not contract_address:
         return {"success": False, "reason": "no_contract_address"}
@@ -263,6 +296,11 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
             return  # فلتر "اليوم فقط" — يبقى صامت زي المتفق عليه سابقًا
+
+        filters_ok, filter_reason = passes_project_filters(detail)
+        if not filters_ok:
+            log.info(f"⏭️ '{slug}': تم تجاهله بسبب فلتر المشروع: {filter_reason}")
+            return
 
         result = await try_buy_now(slug, chain_key, detail)
 
@@ -330,6 +368,12 @@ async def watch_loop():
                 if not found or not fresh_detail or not fresh_detail.get("is_minting"):
                     watchlist.pop(slug, None)
                     enqueue_message(build_gaveup_message(entry["detail"], "المينت لم يعد نشطًا."))
+                    continue
+
+                filters_ok, filter_reason = passes_project_filters(fresh_detail)
+                if not filters_ok:
+                    watchlist.pop(slug, None)
+                    log.info(f"⏭️ '{slug}': أزيل من المراقبة بسبب فلتر المشروع: {filter_reason}")
                     continue
 
                 stage = fresh_detail.get("active_stage")
@@ -470,3 +514,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+BLED=false — النظام متوقف عمدًا (وضع الأمان).")
+        enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false) — ما رح يشتري لين تفعّله.")
+        await telegram_sender()
+        return
+
+    enqueue_message(f"✅ نظام الشراء التلقائي (مراقبة دائمة) اشتغل — يراقب: {', '.join(CHAIN_CONFIGS.keys())}")
+    await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
+
+
+def main():
+    backoff = 2
+    while True:
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            log.info("تم الإيقاف يدويًا.")
+            break
+        except Exception as e:
+            log.critical(f"توقف غير م

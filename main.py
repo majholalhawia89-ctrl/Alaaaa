@@ -176,6 +176,7 @@ def has_x_link(detail: dict) -> bool:
 
 
 def has_website_link(detail: dict) -> bool:
+    """يتحقق من وجود رابط موقع خارجي ضمن بيانات المشروع، لا رابط منصة اجتماعية."""
     excluded_hosts = {
         "x.com", "twitter.com", "t.co", "opensea.io", "discord.com", "discord.gg",
         "telegram.me", "t.me", "instagram.com", "facebook.com", "youtube.com",
@@ -186,9 +187,17 @@ def has_website_link(detail: dict) -> bool:
         if not value.startswith(("http://", "https://")):
             continue
         host = _url_host(value)
-        if host and not any(host == excluded or host.endswith("." + excluded) for excluded in excluded_hosts):
-            return True
+        if not host or "." not in host:
+            continue
+        if any(host == excluded or host.endswith("." + excluded) for excluded in excluded_hosts):
+            continue
+        return True
     return False
+
+
+def has_x_or_website_link(detail: dict) -> bool:
+    """يقبل رابط X أو الموقع أو كليهما، ويرفض فقط عند غيابهما معًا."""
+    return has_x_link(detail) or has_website_link(detail)
 
 
 def get_stage_max_per_wallet(stage: dict):
@@ -213,9 +222,9 @@ def passes_project_filters(detail: dict) -> tuple[bool, str]:
     if max_supply > MAX_COLLECTION_SUPPLY:
         return False, "max_supply_over_10000"
 
-    # يكفي وجود حساب X أو موقع رسمي، ولا يشترط وجود الاثنين.
-    if not (has_x_link(detail) or has_website_link(detail)):
-        return False, "no_x_or_website"
+    # يكفي رابط X أو الموقع أو كليهما؛ يُرفض المشروع فقط إذا غاب الرابطان.
+    if not has_x_or_website_link(detail):
+        return False, "missing_x_or_website"
 
     stage = detail.get("active_stage") or {}
     max_per_wallet = get_stage_max_per_wallet(stage)

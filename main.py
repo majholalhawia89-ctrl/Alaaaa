@@ -43,7 +43,9 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
+FREE_PRICE_THRESHOLD_USD = 0.0  # المجاني فقط
 MAX_COLLECTION_SUPPLY = 10_000
+MAX_MINT_PER_WALLET = 30
 WATCH_POLL_INTERVAL_SECONDS = 15  # كل كم ثانية نعيد فحص المجموعات المراقَبة
 
 logging.basicConfig(
@@ -139,43 +141,69 @@ def stage_has_ended(stage: dict) -> bool:
     return datetime.now(timezone.utc) > end
 
 
-def is_strictly_free(price_wei: int) -> bool:
-    """لا يُقبل إلا السعر الصفري تمامًا؛ رسوم الغاز منفصلة."""
-    return price_wei == 0
+def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
+    # شراء المجاني فقط: أي سعر أكبر من صفر يتم رفضه.
+    return int(price_wei) == 0
 
-
-def _walk_strings(value):
-    """يمرّ على النصوص داخل استجابة OpenSea مهما كان عمق تداخل الحقول."""
+def _iter_strings(value):
     if isinstance(value, dict):
-        for key, item in value.items():
-            yield str(key).lower(), item
-            yield from _walk_strings(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_strings(item)
+        for v in value.values():
+            yield from _iter_strings(v)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            yield from _iter_strings(v)
+    elif isinstance(value, str):
+        yield value
 
 
-def has_required_project_links(detail: dict) -> bool:
-    """يشترط وجود رابط X ورابط موقع خارجي للمشروع."""
-    urls = []
-    for key, value in _walk_strings(detail):
-        if isinstance(value, str) and value.strip():
-            candidate = value.strip()
-            if candidate.startswith(("https://", "http://")):
-                urls.append((key, candidate.lower()))
-    has_x = any(("x.com/" in url or "twitter.com/" in url)
-                and not any(bad in url for bad in ("/share", "/intent/"))
-                for _, url in urls)
-    social_hosts = ("x.com/", "twitter.com/", "discord.gg/", "discord.com/",
-                    "instagram.com/", "t.me/", "telegram.me/", "opensea.io/")
-    has_website = any(not any(host in url for host in social_hosts)
-                      and not any(skip in url for skip in ("localhost", "example.com"))
-                      for _, url in urls)
-    return has_x and has_website
+def _url_host(value: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        return (urlparse(value.strip()).hostname or "").lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def has_x_link(detail: dict) -> bool:
+    for value in _iter_strings(detail):
+        value = value.strip()
+        if not value.startswith(("http://", "https://")):
+            continue
+        host = _url_host(value)
+        if host == "x.com" or host.endswith(".x.com") or host == "twitter.com" or host.endswith(".twitter.com"):
+            return True
+    return False
+
+
+def has_website_link(detail: dict) -> bool:
+    excluded_hosts = {
+        "x.com", "twitter.com", "t.co", "opensea.io", "discord.com", "discord.gg",
+        "telegram.me", "t.me", "instagram.com", "facebook.com", "youtube.com",
+        "youtu.be", "tiktok.com", "medium.com", "github.com",
+    }
+    for value in _iter_strings(detail):
+        value = value.strip()
+        if not value.startswith(("http://", "https://")):
+            continue
+        host = _url_host(value)
+        if host and not any(host == excluded or host.endswith("." + excluded) for excluded in excluded_hosts):
+            return True
+    return False
+
+
+def get_stage_max_per_wallet(stage: dict):
+    """يرجع حد المينت للمحفظة، أو None إذا لم توفره بيانات المرحلة."""
+    for key in ("max_total_mintable_by_wallet", "max_per_wallet", "max_mintable_per_wallet"):
+        value = stage.get(key)
+        if value is not None and value != "":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return -1
+    return None
 
 
 def passes_project_filters(detail: dict) -> tuple[bool, str]:
-    """رفض البيانات الناقصة أو المجموعات التي تتجاوز حد المعروضات."""
     try:
         max_supply = int(detail.get("max_supply") or 0)
     except (TypeError, ValueError):
@@ -183,9 +211,21 @@ def passes_project_filters(detail: dict) -> tuple[bool, str]:
     if max_supply <= 0:
         return False, "unknown_max_supply"
     if max_supply > MAX_COLLECTION_SUPPLY:
-        return False, "supply_over_limit"
-    if not has_required_project_links(detail):
-        return False, "missing_x_or_website"
+        return False, "max_supply_over_10000"
+
+    # يكفي وجود حساب X أو موقع رسمي، ولا يشترط وجود الاثنين.
+    if not (has_x_link(detail) or has_website_link(detail)):
+        return False, "no_x_or_website"
+
+    stage = detail.get("active_stage") or {}
+    max_per_wallet = get_stage_max_per_wallet(stage)
+    if max_per_wallet is None:
+        return False, "unknown_max_per_wallet"
+    if max_per_wallet <= 0:
+        return False, "invalid_max_per_wallet"
+    if max_per_wallet > MAX_MINT_PER_WALLET:
+        return False, "max_per_wallet_over_30"
+
     return True, "ok"
 
 
@@ -253,15 +293,15 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
     if not stage:
         return None
 
-    filters_ok, filter_reason = passes_project_filters(detail)
-    if not filters_ok:
-        return {"success": False, "reason": filter_reason}
-
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
     if remaining <= 0:
         return {"success": False, "reason": "sold_out"}
+
+    filters_ok, filter_reason = passes_project_filters(detail)
+    if not filters_ok:
+        return {"success": False, "reason": filter_reason}
 
     contract_address = detail.get("contract_address")
     if not contract_address:
@@ -272,15 +312,12 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
 
     # السعر: نفضّل القراءة المباشرة من العقد (أدق وأسرع من بيانات OpenSea)
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-    # لا نعتمد على بيانات قديمة من OpenSea إذا تعذرت قراءة السعر من العقد.
-    if onchain_price is None:
-        return None
-    price_wei = int(onchain_price)
-    if not is_strictly_free(price_wei):
-        return None  # السعر ليس صفرًا تمامًا — يبقى بالمراقبة
+    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
 
-    max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
-    max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
+    if not is_free_or_negligible(price_wei, eth_price_usd):
+        return None  # لسا مدفوع — يبقى بالمراقبة
+
+    max_per_wallet = get_stage_max_per_wallet(stage)
     max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
 
     async with buy_lock:
@@ -313,11 +350,11 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
-            return  # فلتر "اليوم فقط"
+            return  # فلتر "اليوم فقط" — يبقى صامت زي المتفق عليه سابقًا
 
         filters_ok, filter_reason = passes_project_filters(detail)
         if not filters_ok:
-            log.info(f"تجاوز '{slug}': فشل شروط المشروع ({filter_reason}).")
+            log.info(f"⏭️ '{slug}': تم تجاهله بسبب فلتر المشروع: {filter_reason}")
             return
 
         result = await try_buy_now(slug, chain_key, detail)
@@ -325,7 +362,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if result is None:
             # مو مجاني بعد — نضيفه للمراقبة الدائمة
             watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            enqueue_message(build_watching_message(detail, "سعر المينت ليس صفرًا تمامًا — بنراقبه حتى يصبح مجانيًا بالكامل."))
+            enqueue_message(build_watching_message(detail, "السعر الحالي مدفوع — بنراقبه لحد ما يصير مجاني."))
             log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة (مدفوع حاليًا).")
             return
 
@@ -391,9 +428,7 @@ async def watch_loop():
                 filters_ok, filter_reason = passes_project_filters(fresh_detail)
                 if not filters_ok:
                     watchlist.pop(slug, None)
-                    enqueue_message(build_gaveup_message(
-                        fresh_detail, f"المشروع لا يحقق شروط الفلترة ({filter_reason})."
-                    ))
+                    log.info(f"⏭️ '{slug}': أزيل من المراقبة بسبب فلتر المشروع: {filter_reason}")
                     continue
 
                 stage = fresh_detail.get("active_stage")
@@ -415,7 +450,7 @@ async def watch_loop():
                 result = await try_buy_now(slug, chain_key, fresh_detail)
 
                 if result is None:
-                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}  # السعر ليس صفرًا تمامًا، استمر
+                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}  # لسا مدفوع، استمر
                     continue
 
                 if result["success"]:

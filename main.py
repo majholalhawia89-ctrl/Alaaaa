@@ -43,7 +43,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.0  # المجاني فقط
+MAX_COLLECTION_SUPPLY = 10_000
 WATCH_POLL_INTERVAL_SECONDS = 15  # كل كم ثانية نعيد فحص المجموعات المراقَبة
 
 logging.basicConfig(
@@ -139,37 +139,53 @@ def stage_has_ended(stage: dict) -> bool:
     return datetime.now(timezone.utc) > end
 
 
-def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    # شراء المجاني فقط: أي سعر أكبر من صفر يتم رفضه.
-    return int(price_wei) == 0
+def is_strictly_free(price_wei: int) -> bool:
+    """لا يُقبل إلا السعر الصفري تمامًا؛ رسوم الغاز منفصلة."""
+    return price_wei == 0
 
-def _iter_strings(value):
+
+def _walk_strings(value):
+    """يمرّ على النصوص داخل استجابة OpenSea مهما كان عمق تداخل الحقول."""
     if isinstance(value, dict):
-        for v in value.values(): yield from _iter_strings(v)
-    elif isinstance(value, (list, tuple, set)):
-        for v in value: yield from _iter_strings(v)
-    elif isinstance(value, str):
-        yield value
+        for key, item in value.items():
+            yield str(key).lower(), item
+            yield from _walk_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_strings(item)
 
-def has_x_link(detail: dict) -> bool:
-    for s in _iter_strings(detail):
-        u=s.strip().lower()
-        if u.startswith(("http://","https://")) and ("x.com/" in u or "twitter.com/" in u): return True
-    return False
 
-def has_website_link(detail: dict) -> bool:
-    excluded=("x.com","twitter.com","t.co","opensea.io","discord.com","discord.gg","telegram.me","t.me","instagram.com","facebook.com","youtube.com","youtu.be","tiktok.com","medium.com","github.com")
-    for s in _iter_strings(detail):
-        u=s.strip().lower()
-        if u.startswith(("http://","https://")) and not any(h in u for h in excluded): return True
-    return False
+def has_required_project_links(detail: dict) -> bool:
+    """يشترط وجود رابط X ورابط موقع خارجي للمشروع."""
+    urls = []
+    for key, value in _walk_strings(detail):
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip()
+            if candidate.startswith(("https://", "http://")):
+                urls.append((key, candidate.lower()))
+    has_x = any(("x.com/" in url or "twitter.com/" in url)
+                and not any(bad in url for bad in ("/share", "/intent/"))
+                for _, url in urls)
+    social_hosts = ("x.com/", "twitter.com/", "discord.gg/", "discord.com/",
+                    "instagram.com/", "t.me/", "telegram.me/", "opensea.io/")
+    has_website = any(not any(host in url for host in social_hosts)
+                      and not any(skip in url for skip in ("localhost", "example.com"))
+                      for _, url in urls)
+    return has_x and has_website
+
 
 def passes_project_filters(detail: dict) -> tuple[bool, str]:
-    try: max_supply=int(detail.get("max_supply") or 0)
-    except (TypeError,ValueError): return False, "invalid_max_supply"
-    if max_supply <= 0: return False, "unknown_max_supply"
-    if max_supply > 10_000: return False, "max_supply_over_10000"
-    if not (has_x_link(detail) or has_website_link(detail)): return False, "no_x_or_website"
+    """رفض البيانات الناقصة أو المجموعات التي تتجاوز حد المعروضات."""
+    try:
+        max_supply = int(detail.get("max_supply") or 0)
+    except (TypeError, ValueError):
+        return False, "invalid_max_supply"
+    if max_supply <= 0:
+        return False, "unknown_max_supply"
+    if max_supply > MAX_COLLECTION_SUPPLY:
+        return False, "supply_over_limit"
+    if not has_required_project_links(detail):
+        return False, "missing_x_or_website"
     return True, "ok"
 
 
@@ -237,15 +253,15 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
     if not stage:
         return None
 
+    filters_ok, filter_reason = passes_project_filters(detail)
+    if not filters_ok:
+        return {"success": False, "reason": filter_reason}
+
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max_supply - total_supply
     if remaining <= 0:
         return {"success": False, "reason": "sold_out"}
-
-    filters_ok, filter_reason = passes_project_filters(detail)
-    if not filters_ok:
-        return {"success": False, "reason": filter_reason}
 
     contract_address = detail.get("contract_address")
     if not contract_address:
@@ -256,10 +272,12 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
 
     # السعر: نفضّل القراءة المباشرة من العقد (أدق وأسرع من بيانات OpenSea)
     onchain_price = await asyncio.to_thread(get_onchain_public_price_wei, w3, contract_address)
-    price_wei = onchain_price if onchain_price is not None else int(stage.get("price", "0"))
-
-    if not is_free_or_negligible(price_wei, eth_price_usd):
-        return None  # لسا مدفوع — يبقى بالمراقبة
+    # لا نعتمد على بيانات قديمة من OpenSea إذا تعذرت قراءة السعر من العقد.
+    if onchain_price is None:
+        return None
+    price_wei = int(onchain_price)
+    if not is_strictly_free(price_wei):
+        return None  # السعر ليس صفرًا تمامًا — يبقى بالمراقبة
 
     max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
     max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
@@ -295,11 +313,11 @@ async def evaluate_new_mint(slug: str, chain_key: str):
 
         stage = detail.get("active_stage")
         if not stage or not started_today_local(stage):
-            return  # فلتر "اليوم فقط" — يبقى صامت زي المتفق عليه سابقًا
+            return  # فلتر "اليوم فقط"
 
         filters_ok, filter_reason = passes_project_filters(detail)
         if not filters_ok:
-            log.info(f"⏭️ '{slug}': تم تجاهله بسبب فلتر المشروع: {filter_reason}")
+            log.info(f"تجاوز '{slug}': فشل شروط المشروع ({filter_reason}).")
             return
 
         result = await try_buy_now(slug, chain_key, detail)
@@ -307,7 +325,7 @@ async def evaluate_new_mint(slug: str, chain_key: str):
         if result is None:
             # مو مجاني بعد — نضيفه للمراقبة الدائمة
             watchlist[slug] = {"chain_key": chain_key, "detail": detail}
-            enqueue_message(build_watching_message(detail, "السعر الحالي مدفوع — بنراقبه لحد ما يصير مجاني."))
+            enqueue_message(build_watching_message(detail, "سعر المينت ليس صفرًا تمامًا — بنراقبه حتى يصبح مجانيًا بالكامل."))
             log.info(f"👀 '{slug}': أُضيف لقائمة المراقبة (مدفوع حاليًا).")
             return
 
@@ -373,7 +391,9 @@ async def watch_loop():
                 filters_ok, filter_reason = passes_project_filters(fresh_detail)
                 if not filters_ok:
                     watchlist.pop(slug, None)
-                    log.info(f"⏭️ '{slug}': أزيل من المراقبة بسبب فلتر المشروع: {filter_reason}")
+                    enqueue_message(build_gaveup_message(
+                        fresh_detail, f"المشروع لا يحقق شروط الفلترة ({filter_reason})."
+                    ))
                     continue
 
                 stage = fresh_detail.get("active_stage")
@@ -395,7 +415,7 @@ async def watch_loop():
                 result = await try_buy_now(slug, chain_key, fresh_detail)
 
                 if result is None:
-                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}  # لسا مدفوع، استمر
+                    watchlist[slug] = {"chain_key": chain_key, "detail": fresh_detail}  # السعر ليس صفرًا تمامًا، استمر
                     continue
 
                 if result["success"]:
@@ -514,22 +534,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-BLED=false — النظام متوقف عمدًا (وضع الأمان).")
-        enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false) — ما رح يشتري لين تفعّله.")
-        await telegram_sender()
-        return
-
-    enqueue_message(f"✅ نظام الشراء التلقائي (مراقبة دائمة) اشتغل — يراقب: {', '.join(CHAIN_CONFIGS.keys())}")
-    await asyncio.gather(listen_opensea(), watch_loop(), telegram_sender())
-
-
-def main():
-    backoff = 2
-    while True:
-        try:
-            asyncio.run(run())
-        except KeyboardInterrupt:
-            log.info("تم الإيقاف يدويًا.")
-            break
-        except Exception as e:
-            log.critical(f"توقف غير م

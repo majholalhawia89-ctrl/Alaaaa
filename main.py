@@ -43,9 +43,7 @@ LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-FREE_PRICE_THRESHOLD_USD = 0.0  # المجاني فقط
-MAX_COLLECTION_SUPPLY = 10_000
-MAX_MINT_PER_WALLET = 30
+FREE_PRICE_THRESHOLD_USD = 0.0000001  # المجاني فقط
 WATCH_POLL_INTERVAL_SECONDS = 15  # كل كم ثانية نعيد فحص المجموعات المراقَبة
 
 logging.basicConfig(
@@ -147,94 +145,31 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
 
 def _iter_strings(value):
     if isinstance(value, dict):
-        for v in value.values():
-            yield from _iter_strings(v)
+        for v in value.values(): yield from _iter_strings(v)
     elif isinstance(value, (list, tuple, set)):
-        for v in value:
-            yield from _iter_strings(v)
+        for v in value: yield from _iter_strings(v)
     elif isinstance(value, str):
         yield value
 
-
-def _url_host(value: str) -> str:
-    from urllib.parse import urlparse
-    try:
-        return (urlparse(value.strip()).hostname or "").lower().removeprefix("www.")
-    except Exception:
-        return ""
-
-
 def has_x_link(detail: dict) -> bool:
-    for value in _iter_strings(detail):
-        value = value.strip()
-        if not value.startswith(("http://", "https://")):
-            continue
-        host = _url_host(value)
-        if host == "x.com" or host.endswith(".x.com") or host == "twitter.com" or host.endswith(".twitter.com"):
-            return True
+    for s in _iter_strings(detail):
+        u=s.strip().lower()
+        if u.startswith(("http://","https://")) and ("x.com/" in u or "twitter.com/" in u): return True
     return False
-
 
 def has_website_link(detail: dict) -> bool:
-    """يتحقق من وجود رابط موقع خارجي ضمن بيانات المشروع، لا رابط منصة اجتماعية."""
-    excluded_hosts = {
-        "x.com", "twitter.com", "t.co", "opensea.io", "discord.com", "discord.gg",
-        "telegram.me", "t.me", "instagram.com", "facebook.com", "youtube.com",
-        "youtu.be", "tiktok.com", "medium.com", "github.com",
-    }
-    for value in _iter_strings(detail):
-        value = value.strip()
-        if not value.startswith(("http://", "https://")):
-            continue
-        host = _url_host(value)
-        if not host or "." not in host:
-            continue
-        if any(host == excluded or host.endswith("." + excluded) for excluded in excluded_hosts):
-            continue
-        return True
+    excluded=("x.com","twitter.com","t.co","opensea.io","discord.com","discord.gg","telegram.me","t.me","instagram.com","facebook.com","youtube.com","youtu.be","tiktok.com","medium.com","github.com")
+    for s in _iter_strings(detail):
+        u=s.strip().lower()
+        if u.startswith(("http://","https://")) and not any(h in u for h in excluded): return True
     return False
 
-
-def has_x_or_website_link(detail: dict) -> bool:
-    """يقبل رابط X أو الموقع أو كليهما، ويرفض فقط عند غيابهما معًا."""
-    return has_x_link(detail) or has_website_link(detail)
-
-
-def get_stage_max_per_wallet(stage: dict):
-    """يرجع حد المينت للمحفظة، أو None إذا لم توفره بيانات المرحلة."""
-    for key in ("max_total_mintable_by_wallet", "max_per_wallet", "max_mintable_per_wallet"):
-        value = stage.get(key)
-        if value is not None and value != "":
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return -1
-    return None
-
-
 def passes_project_filters(detail: dict) -> tuple[bool, str]:
-    try:
-        max_supply = int(detail.get("max_supply") or 0)
-    except (TypeError, ValueError):
-        return False, "invalid_max_supply"
-    if max_supply <= 0:
-        return False, "unknown_max_supply"
-    if max_supply > MAX_COLLECTION_SUPPLY:
-        return False, "max_supply_over_10000"
-
-    # يكفي رابط X أو الموقع أو كليهما؛ يُرفض المشروع فقط إذا غاب الرابطان.
-    if not has_x_or_website_link(detail):
-        return False, "missing_x_or_website"
-
-    stage = detail.get("active_stage") or {}
-    max_per_wallet = get_stage_max_per_wallet(stage)
-    if max_per_wallet is None:
-        return False, "unknown_max_per_wallet"
-    if max_per_wallet <= 0:
-        return False, "invalid_max_per_wallet"
-    if max_per_wallet > MAX_MINT_PER_WALLET:
-        return False, "max_per_wallet_over_30"
-
+    try: max_supply=int(detail.get("max_supply") or 0)
+    except (TypeError,ValueError): return False, "invalid_max_supply"
+    if max_supply <= 0: return False, "unknown_max_supply"
+    if max_supply > 10_000: return False, "max_supply_over_10000"
+    if not (has_x_link(detail) or has_website_link(detail)): return False, "no_x_or_website"
     return True, "ok"
 
 
@@ -326,7 +261,8 @@ async def try_buy_now(slug: str, chain_key: str, detail: dict) -> dict | None:
     if not is_free_or_negligible(price_wei, eth_price_usd):
         return None  # لسا مدفوع — يبقى بالمراقبة
 
-    max_per_wallet = get_stage_max_per_wallet(stage)
+    max_per_wallet_raw = stage.get("max_total_mintable_by_wallet") or stage.get("max_per_wallet")
+    max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
     max_gas_fee_usd = CHAIN_CONFIGS[chain_key]["max_gas_fee_usd"]
 
     async with buy_lock:
